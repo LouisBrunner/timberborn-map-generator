@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"math"
@@ -520,16 +521,36 @@ func GenerateMap(options MapOptions, output string) error {
 	return generator.Generate(f, options)
 }
 
+func usage() {
+	fmt.Printf("Usage: %s [opts] filename\n", os.Args[0])
+	fmt.Printf("options:\n")
+	flag.PrintDefaults()
+}
+
 func main() {
-	defaultSeed := time.Now().Unix() * int64(os.Getgid())
-	fmt.Printf("Seed: %v\n", defaultSeed)
+	var width, height int
+	var seed int64
+	defaultSeed := time.Now().UnixMilli() * int64(os.Getpid())
+	flag.Usage = usage
+	flag.IntVar(&width, "width", 256, "width of the map")
+	flag.IntVar(&height, "height", 256, "height of the map")
+	flag.Int64Var(&seed, "seed", defaultSeed, "seed used for generation")
+	flag.Parse()
+	if flag.NArg() != 1 {
+		fmt.Printf("error: missing filename\n")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	fmt.Printf("Seed: %v\n", seed)
 
 	err := GenerateMap(MapOptions{
 		Width:  256,
 		Height: 256,
 		Seed:   defaultSeed,
-	}, "/Users/louis/Documents/Timberborn/Maps/Test2.timber")
+	}, flag.Args()[0])
 	if err != nil {
-		panic(err.Error())
+		fmt.Printf("error: %v\n", err)
+		os.Exit(1)
 	}
 }
