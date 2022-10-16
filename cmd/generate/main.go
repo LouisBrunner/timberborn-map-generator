@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/aquilax/go-perlin"
 	"github.com/google/uuid"
 )
 
@@ -182,6 +184,14 @@ func (me *MapArray[T]) Set(x, y int, value T) error {
 	return nil
 }
 
+func (me *MapArray[T]) Get(x, y int) (T, error) {
+	position := y*me.width + x
+	if position >= len(me.content) {
+		return me.content[0], fmt.Errorf("could not set %v,%v as it is out-of-range", x, y)
+	}
+	return me.content[position], nil
+}
+
 func (me MapArray[T]) MarshalJSON() ([]byte, error) {
 	buf := bytes.NewBuffer(nil)
 
@@ -218,12 +228,39 @@ func (me MapTime) MarshalJSON() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+const (
+	perlinAlpha = 1.8
+	perlinBeta  = 2.1
+	perlinN     = 3
+
+	mapRatio = 4
+
+	topologyMaxHeight  = 16
+	baseLayer          = 4
+	minimumRiverLength = 5
+)
+
 func (me *Generator) generateTopology(options MapOptions) (*MapArray[int], error) {
 	topology := NewMapArray[int](options.Width, options.Height)
 
+	prln := perlin.NewPerlin(perlinAlpha, perlinBeta, perlinN, options.Seed)
+
+	// minV := -math.Sqrt(float64(perlinN) / 4)
+	maxV := math.Sqrt(float64(perlinN)) / 2
+
 	for i := 0; i < options.Width; i += 1 {
 		for j := 0; j < options.Height; j += 1 {
-			err := topology.Set(i, j, 4)
+			// calculate perlin
+			v := prln.Noise2D(float64(i)/float64(options.Width/mapRatio), float64(j)/float64(options.Height/mapRatio))
+			// move to a -1,1 range
+			v = (v + maxV) / (maxV * 2)
+			// move to 0,MAX range and round
+			v = math.Round(v * topologyMaxHeight)
+			// check range
+			v = math.Max(v, 0)
+			v = math.Min(v, topologyMaxHeight)
+
+			err := topology.Set(i, j, int(v))
 			if err != nil {
 				return nil, err
 			}
@@ -233,24 +270,177 @@ func (me *Generator) generateTopology(options MapOptions) (*MapArray[int], error
 	return &topology, nil
 }
 
-func (me *Generator) generateMap(options MapOptions) (*Map, error) {
-	start := MapEntity{
+func (me *Generator) findStart(options MapOptions, topology *MapArray[int]) (*Vector3, error) {
+	// TODO: wrong, need some kind of BFS search at the center of the map to find it
+	return &Vector3{
+		Vector2: Vector2{
+			X: options.Width / 2,
+			Y: options.Height / 2,
+		},
+		Z: baseLayer,
+	}, nil
+}
+
+type getCoords func(i int) Vector2
+
+func (me *Generator) findSource(options MapOptions, topology *MapArray[int], maxDimension, maxElevation, minimumStreak int, getCoords getCoords) ([]Vector3, error) {
+	lastElevation := -1
+	currentStreak := 0
+
+	checkFound := func(index int) []Vector3 {
+		if currentStreak < minimumStreak {
+			return nil
+		}
+
+		riverBed := make([]Vector3, currentStreak)
+		for i := 0; i < currentStreak; i += 1 {
+			riverBed[i] = Vector3{
+				Vector2: getCoords(index - currentStreak + i),
+				Z:       lastElevation,
+			}
+		}
+		return riverBed
+	}
+
+	for i := 0; i < maxDimension; i += 1 {
+		coords := getCoords(i)
+		elevation, err := topology.Get(coords.X, coords.Y)
+		if err != nil {
+			return nil, err
+		}
+		if elevation <= maxElevation && lastElevation == elevation {
+			currentStreak += 1
+		} else {
+			if found := checkFound(i); found != nil {
+				return found, nil
+			}
+			currentStreak = 1
+		}
+		lastElevation = elevation
+	}
+
+	if found := checkFound(maxDimension - 1); found != nil {
+		return found, nil
+	}
+
+	return nil, fmt.Errorf("not found")
+}
+
+func (me *Generator) findSources(options MapOptions, topology *MapArray[int]) ([]Vector3, error) {
+	maxElevation := baseLayer - 1
+	minimumStreak := minimumRiverLength
+
+	cases := []struct {
+		name      string
+		dimension int
+		getCoords getCoords
+	}{
+		{
+			name:      "top",
+			dimension: options.Width,
+			getCoords: func(i int) Vector2 {
+				return Vector2{X: i, Y: 0}
+			},
+		},
+		{
+			name:      "bottom",
+			dimension: options.Width,
+			getCoords: func(i int) Vector2 {
+				return Vector2{X: i, Y: options.Height - 1}
+			},
+		},
+		{
+			name:      "left",
+			dimension: options.Height,
+			getCoords: func(i int) Vector2 {
+				return Vector2{X: 0, Y: i}
+			},
+		},
+		{
+			name:      "right",
+			dimension: options.Height,
+			getCoords: func(i int) Vector2 {
+				return Vector2{X: options.Width - 1, Y: i}
+			},
+		},
+	}
+
+	var soFar []Vector3
+
+	for _, icase := range cases {
+		sources, err := me.findSource(options, topology, icase.dimension, maxElevation, minimumStreak, icase.getCoords)
+		if err == nil {
+			if soFar == nil {
+				soFar = sources
+				continue
+			}
+			soFar = append(soFar, sources...)
+			return soFar, nil
+		}
+	}
+
+	return nil, fmt.Errorf("could not generate water sources, try another seed")
+}
+
+func (me *Generator) generateEntities(options MapOptions, topology *MapArray[int]) ([]MapEntity, error) {
+	entities := []MapEntity{}
+
+	start, err := me.findStart(options, topology)
+	if err != nil {
+		return nil, err
+	}
+	entities = append(entities, MapEntity{
 		ID:       uuid.New(),
 		Template: MapTemplateStartingLocation,
 		Components: &MapEntityStartLocation{
 			BlockObject: MapBlockObject{
 				Coordinates: Vector3{
 					Vector2: Vector2{
-						X: options.Width / 2,
-						Y: options.Width / 2,
+						X: start.X,
+						Y: start.Y,
 					},
-					Z: 4,
+					Z: start.Z,
 				},
 			},
 		},
+	})
+
+	sources, err := me.findSources(options, topology)
+	if err != nil {
+		return nil, err
+	}
+	for _, source := range sources {
+		entities = append(entities, MapEntity{
+			ID:       uuid.New(),
+			Template: MapTemplateWaterSource,
+			Components: &MapEntityWaterSource{
+				BlockObject: MapBlockObject{
+					Coordinates: Vector3{
+						Vector2: Vector2{
+							X: source.X,
+							Y: source.Y,
+						},
+						Z: source.Z,
+					},
+				},
+				WaterSource: MapWaterSource{
+					SpecifiedStrength: 8,
+					CurrentStrength:   8,
+				},
+			},
+		})
 	}
 
+	return entities, nil
+}
+
+func (me *Generator) generateMap(options MapOptions) (*Map, error) {
 	topology, err := me.generateTopology(options)
+	if err != nil {
+		return nil, err
+	}
+
+	entities, err := me.generateEntities(options, topology)
 	if err != nil {
 		return nil, err
 	}
@@ -260,9 +450,7 @@ func (me *Generator) generateMap(options MapOptions) (*Map, error) {
 		Timestamp: MapTime{
 			Time: time.Now(),
 		},
-		Entities: []MapEntity{
-			start,
-		},
+		Entities: entities,
 		Singletons: MapSingletons{
 			MapSize: MapSize{
 				Size: Vector2{
@@ -333,9 +521,13 @@ func GenerateMap(options MapOptions, output string) error {
 }
 
 func main() {
+	defaultSeed := time.Now().Unix() * int64(os.Getgid())
+	fmt.Printf("Seed: %v\n", defaultSeed)
+
 	err := GenerateMap(MapOptions{
-		Width:  16,
-		Height: 16,
+		Width:  256,
+		Height: 256,
+		Seed:   defaultSeed,
 	}, "/Users/louis/Documents/Timberborn/Maps/Test2.timber")
 	if err != nil {
 		panic(err.Error())
